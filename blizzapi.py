@@ -95,29 +95,76 @@ class CharacterData:
         return f"No data found for {raid_name} [{difficulty}]"
 
     def get_current_enchants(
-            self
+            self,
+            verbose = False
     ):
+        url = self.urls.get_equipment(self.char)
+        response = self.oauth.get(url).json()
         enchant_slots = [
-            "cloak",
-            "chest",
-            "wrist",
-            "legs",
-            "boots",
-            "ring1",
-            "ring2",
-            "weapon"
+            "Back",
+            "Chest",
+            "Wrist",
+            "Legs",
+            "Feet",
+            "Ring 1",
+            "Ring 2",
+            "Main Hand",
+            "Off Hand"
         ]
+        equipped = [item["slot"]["name"] for item in response["equipped_items"]]
+        item_count = 0
+        items_enchanted = 0
+        enchants = {}
+        for item_slot in enchant_slots:
+            if item_slot in equipped:
+                enchant_found = False
+                item_count += 1
+                slot_idx = equipped.index(item_slot)
+                item_data = response["equipped_items"][slot_idx]
+                if "enchantments" in item_data:
+                    for enchant_type in item_data["enchantments"]:
+                        if enchant_type["enchantment_slot"]["type"] == "PERMANENT":
+                            enchant_idx = item_data["enchantments"].index(enchant_type)
+                            enchant_found = True
+                    if enchant_found:
+                        enchant = item_data["enchantments"][enchant_idx]["display_string"]
+                    items_enchanted += 1
+                enchants[item_slot] = enchant
+        enchants = replace_quality_icons(enchants)
+        return_string = f"Enchants:\n- {items_enchanted} / {item_count}"
+        for enchant_slot in enchant_slots:
+            if enchant_slot not in enchants:
+                return_string = f"{return_string}\n- {enchant_slot} missing enchant"
+        if verbose:
+            for item_slot, enchant_name in enchants.items():
+                return_string = f"{return_string}\n- {item_slot}: {enchant_name}"
+        return return_string
 
     def get_current_gems(
             self
     ):
         gem_tertiary = [
-            "head",
-            "wrist",
-            "belt",
+            "Head",
+            "Wrist",
+            "Waist",
         ]
         gem_setting = [
-            "neck",
-            "ring1",
-            "ring2",
+            "Neck",
+            "Ring 1",
+            "Ring 2",
         ]
+
+def replace_quality_icons(
+        enchants_dict: dict[str, str]
+):
+    replacements = {
+        "|A:Professions-ChatIcon-Quality-Tier3:20:20|a": ":quality3:",
+        "|A:Professions-ChatIcon-Quality-Tier2:20:20|a": ":quality2:",
+        "|A:Professions-ChatIcon-Quality-Tier1:20:20|a": ":quality1:",
+    }
+    new_dict = enchants_dict.copy()
+    for slot, item in enchants_dict.items():
+        for string, icon in replacements.items():
+            if string in item:
+                new_dict[slot] = item.replace(string, icon)
+    return new_dict
