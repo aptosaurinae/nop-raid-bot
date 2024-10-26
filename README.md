@@ -13,9 +13,11 @@ Advantages would be:
 - Tailoring to raid leads needs without a third party being involved
 - Automatically being able to check some of the above alongside other checks that raid helper doesn't support e.g. checking a charactername/realm is valid, and automatically pulling class from the API on signup
 
-## Requirements
+## Requirements / dev info
 
-At present the functionality is limited to python-based queries of these elements. This will be developed into a bot that can be used to query this information. Python requirements are provided in `requirements.txt`
+Python requirements are provided in `requirements.txt`. 
+
+At present the functionality is limited to python-based queries of these elements. This will be developed into a `discord.py` bot that can be used to query this information. The `ipynb` file is a bit of a playground currently to allow testing of the core `.py` modules and explore the `json` responses from the API to check formats.
 
 ## Additional information
 
