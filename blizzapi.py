@@ -1,15 +1,32 @@
+"""Contains shortcuts for retrieving data from the blizzard API
 
+It is expected that you create an oauth class and retrieve a token using `requests_oauthlib` first
+to be able to request data
+e.g.:
+``` python
+# set up oauth and get token
+client = BackendApplicationClient(client_id=CLIENT_ID)
+oauth = OAuth2Session(client=client, state="blah123")
+token = oauth.fetch_token(token_url=TOKEN_URL, client_id=CLIENT_ID, client_secret=CLIENT_SECRET)
+
+# retrieve character-specific data
+testchar = Character("Aptosaurinae", "Draenor")
+blizz_urls = BlizzardAPIURLs()
+chardata = CharacterData(testchar, blizz_api_urls=blizz_urls, oauth=oauth)
+aptosaurinae_nerubar_data = chardata.get_specific_raid_data("The War Within", "Nerub-ar Palace", "Heroic")
+aptosaurinae_nerubar_data
+>>> "Nerub-ar Palace [Heroic]:\n- Progress: 3 / 8\n- Sikran, Captain of the Sureki: <t:1729536136:D>\n- Rasha'nan: <t:1729538172:D>\n- Broodtwister Ovi'nax: <t:1729542901:D>"
+```
+"""
+
+from __future__ import annotations
 from dataclasses import dataclass
 from requests_oauthlib import OAuth2Session
+import polars as pl
+
 
 REGION = "eu"
 LANG = "en_GB"
-NAMESPACE = "profile-eu"
-
-@dataclass
-class Character:
-    name: str
-    realm: str
 
 class BlizzardAPIURLs:
     """Provides shortcuts to Blizz API URLs
@@ -17,31 +34,70 @@ class BlizzardAPIURLs:
     def __init__(
             self,
             region: str = REGION,
-            locale:str = LANG,
-            namespace: str = NAMESPACE,
+            locale:str = LANG
     ):
         self.hostname = f"https://{region}.api.blizzard.com"
         self.profile_user = "/profile/user/wow"
         self.profile_char = "/profile/wow/character"
         self.profile_guild = "/profile/wow/guild"
+        self.journal_instance = "/data/wow/journal-instance"
         self.locale = f"locale={locale}"
-        self.namespace= f"namespace={namespace}"
-        self.urlend = f"?{self.locale}&{self.namespace}"
+        self.namespace_profile = "namespace=profile-eu"
+        self.namespace_static = "namespace=static-eu"
+        self.urlend_profile = f"?{self.locale}&{self.namespace_profile}"
+        self.urlend_static = f"?{self.locale}&{self.namespace_static}"
 
     # --- base request
     def _char(self, char: Character):
         return f"{self.hostname}{self.profile_char}/{char.realm.lower()}/{char.name.lower()}"
 
+    def _journal(self):
+        return f"{self.hostname}{self.journal_instance}"
+
     # --- equipment
     def get_equipment(self, char: Character):
-        return f"{self._char(char)}/equipment{self.urlend}"
+        return f"{self._char(char)}/equipment{self.urlend_profile}"
 
     # --- Encounters
     def _encounters(self, char: Character, encounter_type: str):
-        return f"{self._char(char)}/encounters/{encounter_type}{self.urlend}"
+        return f"{self._char(char)}/encounters/{encounter_type}{self.urlend_profile}"
 
     def get_raids(self, char: Character):
         return self._encounters(char, "raids")
+
+    # --- Journal
+    def get_encounter_journal_index(self):
+        return f"{self._journal()}/index{self.urlend_static}"
+
+    def get_encounter_list(self, id: int):
+        return f"{self._journal()}/{id}{self.urlend_static}"
+
+@dataclass
+class Character:
+    name: str
+    realm: str
+
+class BatchData:
+    """Gathers multiple characters data
+    """
+    def __init__(
+            self,
+            oauth: OAuth2Session,
+            blizz_api_urls: BlizzardAPIURLs = None,
+    ):
+        if blizz_api_urls is None:
+            blizz_api_urls = BlizzardAPIURLs()
+        self.urls = blizz_api_urls
+        self.oauth = oauth
+        self.chars = []
+
+    def add_chars(self, chars: list[Character]):
+        for char in chars:
+            self.add_char(char)
+
+    def add_char(self, char: Character):
+        if char not in self.chars:
+            self.chars.append(char)
 
 class CharacterData:
     """Gathers data about a character
@@ -49,21 +105,41 @@ class CharacterData:
     def __init__(
             self,
             char: Character,
-            blizz_api_urls: BlizzardAPIURLs,
             oauth: OAuth2Session,
+            blizz_api_urls: BlizzardAPIURLs = None,
     ):
+        if blizz_api_urls is None:
+            blizz_api_urls = BlizzardAPIURLs()
         self.char = char
         self.urls = blizz_api_urls
         self.oauth = oauth
 
-    def get_current_raid_data(
+    def _get_raid_json(
+        self
+    ):
+        """Retrieves a relevant json containing raid data for the character
+        """
+        url = self.urls.get_raids(self.char)
+        return self.oauth.get(url).json()
+
+    def _get_equipment_json(
+        self
+    ):
+        """Retrieves a relevant json containing equipment data for the character
+        """
+        url = self.urls.get_equipment(self.char)
+        return self.oauth.get(url).json()
+
+    def _blank_df(self):
+        return pl.DataFrame({"CharacterName": [self.char.name], "RealmName": [self.char.realm]})
+
+    def get_specific_raid_data(
             self,
             expansion_name: str,
             raid_name: str,
             difficulty: str
     ):
-        url = self.urls.get_raids(self.char)
-        response = self.oauth.get(url).json()
+        response = self._get_raid_json()
         expansions_list = [
             data["expansion"]["name"]
             for data
@@ -86,6 +162,7 @@ class CharacterData:
                 if difficulty in difficulties_list:
                     difficulty_index = difficulties_list.index(difficulty)
                     char_raid_data = response["expansions"][exp_idx]["instances"][instance_idx]["modes"][difficulty_index]["progress"]
+                    # TODO make these go to dataframe, and have a separate string reporter
                     progress_summary = f"- Progress: {char_raid_data["completed_count"]} / {char_raid_data["total_count"]}"
                     boss_summary = {encounter["encounter"]["name"]: f"<t:{str(encounter["last_kill_timestamp"])[:-3]}:D>" for encounter in char_raid_data["encounters"]}
                     return_string = f"{raid_name} [{difficulty}]:\n{progress_summary}"
@@ -98,8 +175,7 @@ class CharacterData:
             self,
             verbose = False
     ):
-        url = self.urls.get_equipment(self.char)
-        response = self.oauth.get(url).json()
+        response = self._get_equipment_json()
         enchant_slots = [
             "Back",
             "Chest",
@@ -130,7 +206,9 @@ class CharacterData:
                         enchant = item_data["enchantments"][enchant_idx]["display_string"]
                     items_enchanted += 1
                 enchants[item_slot] = enchant
-        enchants = replace_quality_icons(enchants)
+        enchants = _replace_quality_icons(enchants)
+        # TODO make these go to dataframe, and have a separate string reporter
+        # TODO probably want to shorten these strings for non-verbose mode
         return_string = f"Enchants:\n- {items_enchanted} / {item_count}"
         for enchant_slot in enchant_slots:
             if enchant_slot not in enchants:
@@ -153,10 +231,14 @@ class CharacterData:
             "Ring 1",
             "Ring 2",
         ]
+        # TODO implement gem info as with enchants above
 
-def replace_quality_icons(
+def _replace_quality_icons(
         enchants_dict: dict[str, str]
 ):
+    """Replaces the quality icons as they show up in the json response with
+    the discord quality icon emotes in the No Pressure server
+    """
     replacements = {
         "|A:Professions-ChatIcon-Quality-Tier3:20:20|a": ":quality3:",
         "|A:Professions-ChatIcon-Quality-Tier2:20:20|a": ":quality2:",
