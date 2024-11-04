@@ -20,6 +20,8 @@ aptosaurinae_nerubar_data
 """
 
 from __future__ import annotations
+import time
+import warnings
 from dataclasses import dataclass
 from requests_oauthlib import OAuth2Session
 import polars as pl
@@ -27,6 +29,9 @@ import polars as pl
 
 REGION = "eu"
 LANG = "en_GB"
+
+COL_CHAR = "CharacterName"
+COL_REALM = "RealmName"
 
 class BlizzardAPIURLs:
     """Provides shortcuts to Blizz API URLs
@@ -77,6 +82,9 @@ class Character:
     name: str
     realm: str
 
+    def __str__(self):
+        return f"{self.name.capitalize()}-{self.realm.capitalize()}"
+
 class BatchData:
     """Gathers multiple characters data
     """
@@ -100,7 +108,7 @@ class BatchData:
             self.chars.append(char)
 
 class CharacterData:
-    """Gathers data about a character
+    """Manages data gathering for a character
     """
     def __init__(
             self,
@@ -110,13 +118,23 @@ class CharacterData:
     ):
         if blizz_api_urls is None:
             blizz_api_urls = BlizzardAPIURLs()
-        self.char = char
+        self.char: Character = char
         self.urls = blizz_api_urls
         self.oauth = oauth
+        self.df_raid = self._blank_df()
+        self.df_enchants = self._blank_df()
+        # TODO check that char exists and return warning if not?
+
+    def __str__(
+            self
+    ):
+        return f"{self.char}"
+
+    # --- Retrieve jsons
 
     def _get_raid_json(
         self
-    ):
+    ) -> str:
         """Retrieves a relevant json containing raid data for the character
         """
         url = self.urls.get_raids(self.char)
@@ -124,21 +142,68 @@ class CharacterData:
 
     def _get_equipment_json(
         self
-    ):
+    ) -> str:
         """Retrieves a relevant json containing equipment data for the character
         """
         url = self.urls.get_equipment(self.char)
         return self.oauth.get(url).json()
 
-    def _blank_df(self):
-        return pl.DataFrame({"CharacterName": [self.char.name], "RealmName": [self.char.realm]})
+    # --- Utilities
 
-    def get_specific_raid_data(
+    def _blank_df(self) -> pl.DataFrame:
+        """Creates a "blank" df, including char name and realm
+        """
+        return pl.DataFrame({COL_CHAR: [self.char.name], COL_REALM: [self.char.realm]})
+
+    def _format_unix_time(
+            self,
+            unix_time: int,
+            discord_format: bool = True,
+    ) -> str:
+        """Converts unix times into either a discord time string or human readable
+
+        Args:
+            unix_time: Time in unix format (seconds since epoch start)
+            discord_format: Whether to return the strings in discord time format
+        """
+        if discord_format:
+            return f"<t:{unix_time}:D>"
+        else:
+            return time.ctime(unix_time)
+
+    # --- Raid progress
+
+    def _populate_raid(
+            self,
+            progress: dict[str: str],
+    ) -> pl.DataFrame:
+        """Converts a progress dict into a df with char name/realm included
+
+        Args:
+            progress: Dictionary of boss name to unix time int
+
+        Returns:
+            Polars dataframe with summary of raid progress
+        """
+        df = self._blank_df()
+        return df.with_columns(**{key: pl.lit(value) for key, value in progress.items()})
+
+    def _get_specific_raid_data(
             self,
             expansion_name: str,
             raid_name: str,
-            difficulty: str
-    ):
+            difficulty: str,
+    ) -> pl.DataFrame:
+        """Gets raid progress for a given raid & difficulty
+
+        Args:
+            expansion_name: Name of the expansion
+            raid_name: Name of the relevant raid
+            difficulty: Difficulty level of the given raid
+
+        Returns:
+            df with a summary of progress
+        """
         response = self._get_raid_json()
         expansions_list = [
             data["expansion"]["name"]
@@ -162,14 +227,69 @@ class CharacterData:
                 if difficulty in difficulties_list:
                     difficulty_index = difficulties_list.index(difficulty)
                     char_raid_data = response["expansions"][exp_idx]["instances"][instance_idx]["modes"][difficulty_index]["progress"]
-                    # TODO make these go to dataframe, and have a separate string reporter
-                    progress_summary = f"- Progress: {char_raid_data["completed_count"]} / {char_raid_data["total_count"]}"
-                    boss_summary = {encounter["encounter"]["name"]: f"<t:{str(encounter["last_kill_timestamp"])[:-3]}:D>" for encounter in char_raid_data["encounters"]}
-                    return_string = f"{raid_name} [{difficulty}]:\n{progress_summary}"
-                    for boss_name, boss_last_killed in boss_summary.items():
-                        return_string = f"{return_string}\n- {boss_name}: {boss_last_killed}"
-                    return return_string
-        return f"No data found for {raid_name} [{difficulty}]"
+                    return self._populate_raid(
+                        progress={
+                            f"{difficulty}_{encounter["encounter"]["name"]}":
+                            int(str(encounter["last_kill_timestamp"])[:-3])
+                            for encounter in char_raid_data["encounters"]
+                        }
+                    )
+                else:
+                    warnings.warn(f"No data found for {raid_name} [{difficulty}]")
+                    return self._blank_df()
+
+    def _raid_progress_report(
+            self,
+            progress_df: pl.DataFrame,
+            discord_format = True,
+    ) -> str:
+        """Reformats the progress for the raid into a nice output string
+
+        Args:
+            progress_df: Dataframe with a summary of progress
+            discord_format: Whether to format times as strings or discord strings
+
+        Returns:
+            string of progression, nicely formatted
+        """
+        progress_str = None
+        for col in progress_df.columns:
+            if col not in [COL_CHAR, COL_REALM]:
+                unix_time = progress_df.select(col)[0,0]
+                time_str = self._format_unix_time(unix_time, discord_format)
+                if progress_str is None:
+                    progress_str = f"- {col}: {time_str}"
+                else:
+                    progress_str = f"{progress_str}\n- {col}: {time_str}"
+        return progress_str
+
+    def get_specific_raid_data(
+            self,
+            expansion_name: str,
+            raid_name: str,
+            difficulty: str,
+    ):
+        """Gets a summary of raid progress as a nice output string
+
+        Args:
+            expansion_name: Name of the expansion
+            raid_name: Name of the relevant raid
+            difficulty: Difficulty level of the given raid
+
+        Returns:
+            string of progression, nicely formatted
+        """
+        df = self._get_specific_raid_data(
+            expansion_name=expansion_name,
+            raid_name=raid_name,
+            difficulty=difficulty
+        )
+        if df is not None:
+            return f"{self.char}:\n{self._raid_progress_report(df)}"
+        else:
+            return f"{self.char}: No progress found"
+
+    # --- Equipment
 
     def get_current_enchants(
             self,
