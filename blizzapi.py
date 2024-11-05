@@ -4,6 +4,13 @@ It is expected that you create an oauth class and retrieve a token using `reques
 to be able to request data
 e.g.:
 ``` python
+from oauthlib.oauth2 import BackendApplicationClient
+from requests_oauthlib import OAuth2Session
+import blizzapi
+
+# you'll have to input your own CLIENT_ID and CLIENT_SECRET from the API
+TOKEN_URL = "https://oauth.battle.net/token"
+
 # set up oauth and get token
 client = BackendApplicationClient(client_id=CLIENT_ID)
 oauth = OAuth2Session(client=client, state="blah123")
@@ -14,9 +21,9 @@ raid = "Nerub-ar Palace"
 difficulty = "Heroic"
 
 # retrieve character-specific data
-testchar = Character("Aptosaurinae", "Draenor")
-blizz_urls = BlizzardAPIURLs()
-chardata = CharacterData(testchar, blizz_api_urls=blizz_urls, oauth=oauth)
+testchar = blizzapi.Character("Aptosaurinae", "Draenor")
+blizz_urls = blizzapi.BlizzardAPIURLs()
+chardata = blizzapi.CharacterData(testchar, blizz_api_urls=blizz_urls, oauth=oauth)
 chardata.get_specific_raid_data(expansion, raid, difficulty)
 >>> "Aptosaurinae-Draenor:\n- Heroic Ulgrax the Devourer: <t:1730661349:D>\n- Heroic The Bloodbound Horror: <t:1730662050:D>\n- Heroic Sikran, Captain of the Sureki: <t:1730662840:D>\n- Heroic Rasha'nan: <t:1730663569:D>\n- Heroic Broodtwister Ovi'nax: <t:1730664631:D>\n- Heroic Nexus-Princess Ky'veza: <t:1730667103:D>"
 chardata.get_specific_raid_lockout_status(expansion, raid, difficulty)
@@ -33,11 +40,11 @@ batch_data.add_chars([
     Character("Aptosoar, "Draenor"),
     Character("Aptodin", "Draenor")
 ])
-batch_data.get_raid_report(expansion, raid, difficulty)
+batch_data.get_raid_df(expansion, raid, difficulty)
 >>> polars dataframe of raid information
-batch_data.get_raid_report(expansion, raid, difficulty, report_type="lockout")
+batch_data.get_raid_df(expansion, raid, difficulty, report_type="lockout")
 >>> polars dataframe of raid lockout information
-batch_data.get_equipment_report()
+batch_data.get_equipment_df()
 >>> polars dataframe of equipment
 ```
 """
@@ -51,7 +58,6 @@ import warnings
 from dataclasses import dataclass
 from requests_oauthlib import OAuth2Session
 import polars as pl
-
 
 REGION = "eu"
 LANG = "en_GB"
@@ -158,7 +164,7 @@ class BatchData:
         if char not in self.chars:
             self.chars.append(CharacterData(char, self.oauth, self.urls))
 
-    def get_equipment_report(
+    def get_equipment_df(
             self
     ):
         """Gets enchant and gem data for the current character set
@@ -173,7 +179,7 @@ class BatchData:
         df = df.fill_null("No Item")
         return df
 
-    def get_raid_report(
+    def get_raid_df(
             self,
             expansion_name: str,
             raid_name: str,
