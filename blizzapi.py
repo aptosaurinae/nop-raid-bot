@@ -9,13 +9,36 @@ client = BackendApplicationClient(client_id=CLIENT_ID)
 oauth = OAuth2Session(client=client, state="blah123")
 token = oauth.fetch_token(token_url=TOKEN_URL, client_id=CLIENT_ID, client_secret=CLIENT_SECRET)
 
+expansion = "The War Within"
+raid = "Nerub-ar Palace"
+difficulty = "Heroic"
+
 # retrieve character-specific data
 testchar = Character("Aptosaurinae", "Draenor")
 blizz_urls = BlizzardAPIURLs()
 chardata = CharacterData(testchar, blizz_api_urls=blizz_urls, oauth=oauth)
-aptosaurinae_nerubar_data = chardata.get_specific_raid_data("The War Within", "Nerub-ar Palace", "Heroic")
-aptosaurinae_nerubar_data
->>> "Nerub-ar Palace [Heroic]:\n- Progress: 3 / 8\n- Sikran, Captain of the Sureki: <t:1729536136:D>\n- Rasha'nan: <t:1729538172:D>\n- Broodtwister Ovi'nax: <t:1729542901:D>"
+chardata.get_specific_raid_data(expansion, raid, difficulty)
+>>> "Aptosaurinae-Draenor:\n- Heroic Ulgrax the Devourer: <t:1730661349:D>\n- Heroic The Bloodbound Horror: <t:1730662050:D>\n- Heroic Sikran, Captain of the Sureki: <t:1730662840:D>\n- Heroic Rasha'nan: <t:1730663569:D>\n- Heroic Broodtwister Ovi'nax: <t:1730664631:D>\n- Heroic Nexus-Princess Ky'veza: <t:1730667103:D>"
+chardata.get_specific_raid_lockout_status(expansion, raid, difficulty)
+>>> "Aptosaurinae-Draenor:\n- Heroic Ulgrax the Devourer: True\n- Heroic The Bloodbound Horror: True\n- Heroic Sikran, Captain of the Sureki: True\n- Heroic Rasha'nan: True\n- Heroic Broodtwister Ovi'nax: True\n- Heroic Nexus-Princess Ky'veza: True"
+chardata.get_current_enchants()
+>>> 'Aptosaurinae-Draenor has no missing enchants'
+chardata.get_current_gems()
+>>> 'Aptosaurinae-Draenor has no missing gems'
+
+# run a set of characters through the api queries
+batch_data = blizzapi.BatchData(oauth, blizz_urls)
+batch_data.add_chars([
+    Character("Aptosaurinae", "Draenor"),
+    Character("Aptosoar, "Draenor"),
+    Character("Aptodin", "Draenor")
+])
+batch_data.get_raid_report(expansion, raid, difficulty)
+>>> polars dataframe of raid information
+batch_data.get_raid_report(expansion, raid, difficulty, report_type="lockout")
+>>> polars dataframe of raid lockout information
+batch_data.get_equipment_report()
+>>> polars dataframe of equipment
 ```
 """
 
@@ -47,18 +70,17 @@ ENCHANT_SLOTS = [
     "Main Hand",
     "Off Hand"
 ]
-GEM_TERTIARY = [
-    "Head",
-    "Wrist",
-    "Waist",
-]
-GEM_SETTING = [
-    "Neck",
-    "Ring 1",
-    "Ring 2",
-]
+GEM_TERTIARY = {
+    "Head": 1,
+    "Wrist": 1,
+    "Waist": 1,
+}
+GEM_SETTING = {
+    "Neck": 2,
+    "Ring 1": 2,
+    "Ring 2": 2,
+}
 MISSING_ENCHANT_STR = "Missing Enchant"
-MISSING_GEM_STR = "Missing Gem or Socket"
 
 class BlizzardAPIURLs:
     """Provides shortcuts to Blizz API URLs
@@ -143,7 +165,10 @@ class BatchData:
         """
         dataframes = []
         for char in self.chars:
-            dataframes.append(char._get_current_enchants_df())
+            enchants = char._get_current_enchants_df()
+            gems = char._get_current_gems_df()
+            equipment = enchants.join(gems, on=[COL_CHAR, COL_REALM])
+            dataframes.append(equipment)
         df: pl.DataFrame = pl.concat(dataframes, how="diagonal_relaxed")
         df = df.fill_null("No Item")
         return df
@@ -575,24 +600,27 @@ class CharacterData:
         """Gets a dataframe of current gems for the character
         """
         response = self._get_equipment_json()
-        gem_slots = GEM_TERTIARY + GEM_SETTING
+        gem_slots = GEM_TERTIARY | GEM_SETTING
         equipped = [item["slot"]["name"] for item in response["equipped_items"]]
         gems = {}
-        for item_slot in gem_slots:
+        for item_slot, sockets_expected in gem_slots.items():
             if item_slot in equipped:
                 slot_idx = equipped.index(item_slot)
                 item_data = response["equipped_items"][slot_idx]
-                gems_for_item = ""
-                if "sockets" in item_data:
-                    for socket in item_data["sockets"]:
-                        if "item" in socket:
-                            if gems_for_item == "":
-                                gems_for_item = socket["item"]["name"]
-                            else:
-                                gems_for_item = f"{gems_for_item}, {socket["item"]["name"]}"
-                else:
-                    gems_for_item = MISSING_GEM_STR
-                gems[item_slot] = gems_for_item
+                for socket_num in range(sockets_expected):
+                    if sockets_expected > 1:
+                        socket_num_str = f" {socket_num + 1}"
+                    else:
+                        socket_num_str = ""
+                    if "sockets" not in item_data:
+                        gems[f"{item_slot} gem{socket_num_str}"] = "Missing socket"
+                    elif socket_num + 1 > len(item_data["sockets"]):
+                        gems[f"{item_slot} gem{socket_num_str}"] = "Missing socket"
+                    elif "item" not in item_data["sockets"][socket_num]:
+                        gems[f"{item_slot} gem{socket_num_str}"] = "Missing gem"
+                    else:
+                        gems[f"{item_slot} gem{socket_num_str}"] = (
+                            item_data["sockets"][socket_num]["item"]["name"])
         gems = _replace_quality_icons(gems)
         return self._populate_from_dict(data_dict=gems)
 
@@ -612,8 +640,11 @@ class CharacterData:
         equipment_cols.remove(COL_CHAR)
         equipment_cols.remove(COL_REALM)
         for item_slot in gems_df.select(equipment_cols).columns:
-            if gems_df.select(item_slot)[0,0] == MISSING_GEM_STR:
-                return_string = f"{return_string}\n- {item_slot}: {MISSING_GEM_STR}"
+            if (
+                gems_df.select(item_slot)[0,0] == "Missing socket"
+                or gems_df.select(item_slot)[0,0] == "Missing gem"
+            ):
+                return_string = f"{return_string}\n- {item_slot}: {gems_df.select(item_slot)[0,0]}"
             elif verbose:
                 return_string = f"{return_string}\n- {item_slot}: {gems_df.select(item_slot)[0,0]}"
 
