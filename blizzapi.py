@@ -62,8 +62,7 @@ import polars as pl
 REGION = "eu"
 LANG = "en_GB"
 
-COL_CHAR = "CharacterName"
-COL_REALM = "RealmName"
+COL_CHAR = "CharacterName-RealmName"
 
 ENCHANT_SLOTS = [
     "Back",
@@ -86,7 +85,13 @@ GEM_SETTING = {
     "Ring 1": 2,
     "Ring 2": 2,
 }
+MISSING_ITEM_STR = "No Item"
 MISSING_ENCHANT_STR = "Missing Enchant"
+MISSING_GEM_STR = "Missing Gem"
+MISSING_SOCKET_STR = "Missing Socket"
+
+class CharacterNotFoundError(Exception):
+    pass
 
 class BlizzardAPIURLs:
     """Provides shortcuts to Blizz API URLs
@@ -166,18 +171,72 @@ class BatchData:
 
     def get_equipment_df(
             self
-    ):
+    ) -> pl.DataFrame:
         """Gets enchant and gem data for the current character set
+
+        Returns:
+            Table of equipment for all characters
         """
         dataframes = []
         for char in self.chars:
             enchants = char._get_current_enchants_df()
             gems = char._get_current_gems_df()
-            equipment = enchants.join(gems, on=[COL_CHAR, COL_REALM])
+            equipment = enchants.join(gems, on=[COL_CHAR])
             dataframes.append(equipment)
         df: pl.DataFrame = pl.concat(dataframes, how="diagonal_relaxed")
-        df = df.fill_null("No Item")
+        df = df.fill_null(MISSING_ITEM_STR)
         return df
+
+    def get_equipment_summary(
+            self
+    ) -> str:
+        """Gets enchant and gem data for the current character set
+
+        Returns:
+            Multiline string with code formatting of an equipment table
+        """
+        equipment_df = self.get_equipment_df()
+        for column in equipment_df.columns:
+            if column != COL_CHAR:
+                equipment_df = equipment_df.with_columns(
+                    pl.when(pl.col(column).is_in([MISSING_ITEM_STR, MISSING_SOCKET_STR]))
+                    .then(pl.lit("X"))
+                    .when(pl.col(column).is_in([MISSING_GEM_STR, MISSING_ENCHANT_STR]))
+                    .then(pl.lit("N"))
+                    .otherwise(pl.lit("Y"))
+                    .alias(column)
+                )
+        initial_str_length = equipment_df.select(pl.col(COL_CHAR).str.len_chars()).max()[0,0]
+        all_items = [item.split(" ") for item in equipment_df.columns if item != "CharacterName-RealmName"]
+        max_sizes = []
+        for each_item in all_items:
+            max_sizes.append(max([len(item) for item in each_item]))
+        max_item_len = max(max_sizes)
+        item_counts = [len(item) for item in all_items]
+        max_items = max(item_counts)
+        headers = [" " * initial_str_length for item in range(max_items)]
+        for equipment_item in all_items:
+            blank_string = ' ' * (max_item_len + 1)
+            item_pieces_count = 0
+            for num in range(max_items):
+                if max_items - num > len(equipment_item):
+                    headers[num] = f"{headers[num]} {blank_string}"
+                else:
+                    add_string = f"{' ' * (max_item_len + 1 - len(equipment_item[item_pieces_count]))}{equipment_item[item_pieces_count]}"
+                    item_pieces_count += 1
+                    headers[num] = f"{headers[num]} {add_string}"
+        print(headers)
+        return_string = "Equipment summary (Y for enchanted/gemmed, N for not, X for missing entirely)\n```"
+        for header in headers:
+            return_string = f"{return_string}\n{header}"
+        for char in self.chars:
+            char_row = equipment_df.row(by_predicate=(pl.col(COL_CHAR) == str(char.char)))
+            char_string = f"{char_row[0]}"
+            char_string = f"{char_string}{' ' * (initial_str_length - len(char_string))} {" ".join([f"{' ' * (max_item_len + 1 - len(item))}{item}" for item in char_row[1:]])}"
+            return_string = f"{return_string}\n{char_string}"
+        return_string = f"{return_string}```"
+        return return_string
+
 
     def get_raid_df(
             self,
@@ -192,6 +251,9 @@ class BatchData:
             expansion_name: Name of the expansion
             raid_name: Name of the relevant raid
             difficulty: Difficulty level of the given raid
+            report_type: either "progress" or "lockout"
+                progress: time of last kill for each boss
+                lockout: whether they are locked out this reset or not
 
         Returns:
             df with a summary of progress
@@ -211,17 +273,15 @@ class BatchData:
             raid_name=raid_name,
             oauth=self.oauth,
         ).get_raid_encounters()
-        basic_dict = {
-            COL_CHAR: pl.String,
-            COL_REALM: pl.String,
-        }
 
+        basic_dict = {COL_CHAR: pl.String,}
         encounters_dict = {
             f"{difficulty} {encounter}": col_dtype
             for encounter
             in raid_encounters
         }
         blank_df = pl.DataFrame(schema=basic_dict | encounters_dict)
+
         dataframes = [blank_df]
         for char in self.chars:
             if report_type == progress_str:
@@ -243,6 +303,88 @@ class BatchData:
         df: pl.DataFrame = pl.concat(dataframes, how="diagonal_relaxed")
         df = df.fill_null(False)
         return df
+
+    def get_raid_progress_summary(
+            self,
+            expansion_name: str,
+            raid_name: str,
+            difficulty: str,
+    ) -> str:
+        """Gets a nicely formatted string summary of raid progress
+
+        Args:
+            expansion_name: Name of the expansion
+            raid_name: Name of the relevant raid
+            difficulty: Difficulty level of the given raid
+            report_type: either "progress" or "lockout"
+                progress: time of last kill for each boss
+                lockout: whether they are locked out this reset or not
+
+        Returns:
+            Table of raid data for all characters
+            "Y" if they have ever killed the boss, "N" if not
+        """
+        raid_lockout_df = self.get_raid_df(
+            expansion_name=expansion_name,
+            raid_name=raid_name,
+            difficulty=difficulty,
+            report_type="progress"
+        )
+        for column in raid_lockout_df.columns:
+            if column != COL_CHAR:
+                raid_lockout_df = raid_lockout_df.with_columns(
+                    pl.when(pl.col(column).is_null())
+                    .then(pl.lit("N"))
+                    .otherwise(pl.lit("Y"))
+                    .alias(column)
+                )
+        initial_str_length = raid_lockout_df.select(pl.col(COL_CHAR).str.len_chars()).max()[0,0]
+        bosses_numbers = "".join([f" {number + 1}" for number in range(len(raid_lockout_df.columns) - 1)])
+        return_string = f"Raid Progress Summary for {raid_name} [{difficulty}] (Y if boss has been killed ever by this character)\n```{' ' * initial_str_length}{bosses_numbers}"
+        for char in self.chars:
+            char_row = raid_lockout_df.row(by_predicate=(pl.col(COL_CHAR) == str(char.char)))
+            char_string = f"{char_row[0]}"
+            char_string = f"{char_string}{' ' * (initial_str_length - len(char_string))} {" ".join([str(item) for item in char_row[1:]])}"
+            return_string = f"{return_string}\n{char_string}"
+        return_string = f"{return_string}```"
+        return return_string
+
+    def get_raid_lockout_summary(
+            self,
+            expansion_name: str,
+            raid_name: str,
+            difficulty: str,
+    ) -> str:
+        """Gets a nicely formatted string summary of raid lockouts
+
+        Args:
+            expansion_name: Name of the expansion
+            raid_name: Name of the relevant raid
+            difficulty: Difficulty level of the given raid
+            report_type: either "progress" or "lockout"
+                progress: time of last kill for each boss
+                lockout: whether they are locked out this reset or not
+
+        Returns:
+            Table of raid data for all characters
+            "Y" if they have killed the boss this reset, "N" if not
+        """
+        raid_lockout_df = self.get_raid_df(
+            expansion_name=expansion_name,
+            raid_name=raid_name,
+            difficulty=difficulty,
+            report_type="lockout"
+        )
+        initial_str_length = raid_lockout_df.select(pl.col(COL_CHAR).str.len_chars()).max()[0,0]
+        bosses_numbers = "".join([f" {number + 1}" for number in range(len(raid_lockout_df.columns) - 1)])
+        return_string = f"Raid Lockout Summary for {raid_name} [{difficulty}] (Y if boss has been killed this reset)\n```{' ' * initial_str_length}{bosses_numbers}"
+        for char in self.chars:
+            char_row = raid_lockout_df.row(by_predicate=(pl.col(COL_CHAR) == str(char.char)))
+            char_string = f"{char_row[0]}"
+            char_string = f"{char_string}{' ' * (initial_str_length - len(char_string))} {" ".join([str(item) for item in char_row[1:]]).replace("True", "Y").replace("False", "N")}"
+            return_string = f"{return_string}\n{char_string}"
+        return_string = f"{return_string}```"
+        return return_string
 
 
 class RaidInfo:
@@ -296,8 +438,7 @@ class CharacterData:
         self.equipment_json = None
         self.equipment_json_time = None
         self.df_enchants = self._blank_df()
-        # TODO check that char exists and return warning if not?
-        # maybe that check should be at the character level instead?
+        self.exists = self._exists()
 
     def __str__(
             self
@@ -336,10 +477,14 @@ class CharacterData:
 
     # --- Utilities
 
+    def _exists(self) -> str:
+        return "character" in self._get_equipment_json()
+            #raise CharacterNotFoundError("Could not retrieve valid equipment data for the character")
+
     def _blank_df(self) -> pl.DataFrame:
         """Creates a "blank" df, including char name and realm
         """
-        return pl.DataFrame({COL_CHAR: [self.char.name], COL_REALM: [self.char.realm]})
+        return pl.DataFrame({COL_CHAR: [f"{self.char.name}-{self.char.realm}"]})
 
     def _format_unix_time(
             self,
@@ -360,7 +505,7 @@ class CharacterData:
     def _populate_from_dict(
             self,
             data_dict: dict[str, str]
-    ):
+    ) -> pl.DataFrame:
         """Converts a dict into a df with char name/realm included
 
         Args:
@@ -373,6 +518,14 @@ class CharacterData:
         return df.with_columns(**{key: pl.lit(value) for key, value in data_dict.items()})
 
     # --- Raid progress
+
+    def _raid_data_none(
+            self,
+            raid_name: str = "",
+            difficulty: str = "",
+    ):
+        warnings.warn(f"No data found for {self.char.name}-{self.char.realm} {raid_name} [{difficulty}]")
+        return self._blank_df()
 
     def _get_specific_raid_data_df(
             self,
@@ -390,10 +543,11 @@ class CharacterData:
         Returns:
             df with a summary of progress
         """
+        if not self.exists:
+            return self._raid_data_none(raid_name, difficulty)
         response = self._get_raid_json()
         if "expansions" not in response:
-            warnings.warn(f"No data found for {raid_name} [{difficulty}]")
-            return self._blank_df()
+            return self._raid_data_none(raid_name, difficulty)
         expansions_list = [
             data["expansion"]["name"]
             for data
@@ -424,8 +578,7 @@ class CharacterData:
                         }
                     )
                 else:
-                    warnings.warn(f"No data found for {raid_name} [{difficulty}]")
-                    return self._blank_df()
+                    return self._raid_data_none(raid_name, difficulty)
 
     def _raid_progress_report(
             self,
@@ -443,7 +596,7 @@ class CharacterData:
         """
         progress_str = None
         for col in progress_df.columns:
-            if col not in [COL_CHAR, COL_REALM]:
+            if col not in [COL_CHAR]:
                 unix_time = progress_df.select(col)[0,0]
                 time_str = self._format_unix_time(unix_time, discord_format)
                 if progress_str is None:
@@ -501,9 +654,9 @@ class CharacterData:
             raid_name=raid_name,
             difficulty=difficulty
         )
-        if len(df.columns) == 2:
+        if len(df.columns) == 1:
             return df
-        df = df.melt(id_vars=[COL_CHAR, COL_REALM])
+        df = df.melt(id_vars=[COL_CHAR])
         df = df.with_columns(
             pl.col("value")
             .map_elements(is_locked_out, return_dtype=pl.Boolean)
@@ -512,7 +665,7 @@ class CharacterData:
         df = df.drop("value")
         df = df.pivot(
             values="is_locked",
-            index=[COL_CHAR, COL_REALM],
+            index=[COL_CHAR],
             columns="variable"
         )
         return df
@@ -522,7 +675,7 @@ class CharacterData:
             expansion_name: str,
             raid_name: str,
             difficulty: str,
-    ):
+    ) -> str:
         """Gets a summary of raid lockout status as a nice output string
 
         Args:
@@ -540,7 +693,6 @@ class CharacterData:
         )
         relevant_cols = list(df.columns)
         relevant_cols.remove(COL_CHAR)
-        relevant_cols.remove(COL_REALM)
         return_string = f"{self.char.name}-{self.char.realm}:"
         for col in relevant_cols:
             return_string = f"{return_string}\n- {col}: {df.select(col)[0,0]}"
@@ -548,11 +700,19 @@ class CharacterData:
 
     # --- Equipment
 
+    def _equipment_data_none(
+            self,
+    ) -> pl.DataFrame:
+        warnings.warn(f"No equipment found for {self.char.name}-{self.char.realm}")
+        return self._blank_df()
+
     def _get_current_enchants_df(
             self,
     ) -> pl.DataFrame:
         """Gets a dataframe of current enchants for the character
         """
+        if not self.exists:
+            return self._equipment_data_none()
         response = self._get_equipment_json()
         enchant_slots = ENCHANT_SLOTS
         equipped = [item["slot"]["name"] for item in response["equipped_items"]]
@@ -578,18 +738,20 @@ class CharacterData:
     def get_current_enchants(
             self,
             verbose = False
-    ):
+    ) -> str:
         """Gets a nicely formatted string representation of current enchants
 
         Args:
             verbose: whether to report on missing slots
         """
-        enchants_df = self._get_current_enchants_df()
+        if not self.exists:
+            return_string = f"{self.char.name}-{self.char.realm} does not exist"
+        else:
+            return_string = f"{self.char.name}-{self.char.realm} Enchants:"
 
-        return_string = f"{self.char.name}-{self.char.realm} Enchants:"
+        enchants_df = self._get_current_enchants_df()
         equipment_cols = list(enchants_df.columns)
         equipment_cols.remove(COL_CHAR)
-        equipment_cols.remove(COL_REALM)
         for item_slot in enchants_df.select(equipment_cols).columns:
             if enchants_df.select(item_slot)[0,0] == MISSING_ENCHANT_STR:
                 return_string = f"{return_string}\n- {item_slot}: {MISSING_ENCHANT_STR}"
@@ -602,9 +764,11 @@ class CharacterData:
 
     def _get_current_gems_df(
             self
-    ):
+    ) -> pl.DataFrame:
         """Gets a dataframe of current gems for the character
         """
+        if not self.exists:
+            return self._equipment_data_none()
         response = self._get_equipment_json()
         gem_slots = GEM_TERTIARY | GEM_SETTING
         equipped = [item["slot"]["name"] for item in response["equipped_items"]]
@@ -619,11 +783,11 @@ class CharacterData:
                     else:
                         socket_num_str = ""
                     if "sockets" not in item_data:
-                        gems[f"{item_slot} gem{socket_num_str}"] = "Missing socket"
+                        gems[f"{item_slot} gem{socket_num_str}"] = MISSING_SOCKET_STR
                     elif socket_num + 1 > len(item_data["sockets"]):
-                        gems[f"{item_slot} gem{socket_num_str}"] = "Missing socket"
+                        gems[f"{item_slot} gem{socket_num_str}"] = MISSING_SOCKET_STR
                     elif "item" not in item_data["sockets"][socket_num]:
-                        gems[f"{item_slot} gem{socket_num_str}"] = "Missing gem"
+                        gems[f"{item_slot} gem{socket_num_str}"] = MISSING_GEM_STR
                     else:
                         gems[f"{item_slot} gem{socket_num_str}"] = (
                             item_data["sockets"][socket_num]["item"]["name"])
@@ -633,22 +797,24 @@ class CharacterData:
     def get_current_gems(
             self,
             verbose = False
-    ):
+    ) -> str:
         """Gets a nicely formatted string representation of current gems
 
         Args:
             verbose: whether to report on missing slots
         """
-        gems_df = self._get_current_gems_df()
+        if not self.exists:
+            return_string = f"{self.char.name}-{self.char.realm} does not exist"
+        else:
+            return_string = f"{self.char.name}-{self.char.realm} Gems:"
 
-        return_string = f"{self.char.name}-{self.char.realm} Gems:"
+        gems_df = self._get_current_gems_df()
         equipment_cols = list(gems_df.columns)
         equipment_cols.remove(COL_CHAR)
-        equipment_cols.remove(COL_REALM)
         for item_slot in gems_df.select(equipment_cols).columns:
             if (
-                gems_df.select(item_slot)[0,0] == "Missing socket"
-                or gems_df.select(item_slot)[0,0] == "Missing gem"
+                gems_df.select(item_slot)[0,0] == MISSING_SOCKET_STR
+                or gems_df.select(item_slot)[0,0] == MISSING_GEM_STR
             ):
                 return_string = f"{return_string}\n- {item_slot}: {gems_df.select(item_slot)[0,0]}"
             elif verbose:
@@ -683,7 +849,7 @@ def is_locked_out(
 
 def _replace_quality_icons(
         enchants_dict: dict[str, str]
-):
+) -> dict[str, str]:
     """Replaces the quality icons as they show up in the json response with
     the discord quality icon emotes in the No Pressure server
     """
